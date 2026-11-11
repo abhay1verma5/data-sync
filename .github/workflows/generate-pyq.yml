@@ -2,15 +2,11 @@ name: PYQ Generator + Crawler
 
 on:
   schedule:
-    - cron: '30 2 * * *'   # Daily 2:30 AM UTC
+    - cron: '30 2 * * *'
   workflow_dispatch:
     inputs:
       exam:
         description: 'Specific exam (leave empty for auto-rotation)'
-        required: false
-        default: ''
-      count:
-        description: 'Questions per subject/year combo'
         required: false
         default: ''
       crawl_only:
@@ -32,8 +28,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download latest DB from release
+        run: |
+          curl -fL -o db.sqlite3.gz "https://github.com/abhay1verma5/data-sync/releases/download/db-v1/db.sqlite3.gz" || true
+          [ -f db.sqlite3.gz ] && gunzip -f db.sqlite3.gz || echo "No release DB, starting fresh"
 
       - uses: actions/setup-python@v5
         with:
@@ -86,26 +85,23 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           EXAM="${{ github.event.inputs.exam }}"
-          COUNT="${{ github.event.inputs.count }}"
           if [ -n "$EXAM" ]; then
-            ARGS="--exam $EXAM"
-            [ -n "$COUNT" ] && ARGS="$ARGS --count $COUNT"
-            timeout 600 python manage.py generate_pyq $ARGS 2>&1 || true
+            timeout 600 python manage.py generate_pyq --exam "$EXAM" --skip-existing 2>&1 || true
           else
             BATCH=$(($(date +%H) % 12))
             case $BATCH in
               0) EXAMS="jee_main jee_advanced neet gate_cse gate_ece" ;;
-              1) EXAMS="gate_me gate_ee gate_ce gate_ch gate_in gate_bt gate_pi gate_xe ese isro" ;;
-              2) EXAMS="ssc_cgl ssc_chsl ssc_mts ssc_gd ssc_cpo ssc_je ssc_steno" ;;
-              3) EXAMS="upsc_prelims upsc_mains nda cds afcat capf" ;;
-              4) EXAMS="rrb_ntpc rrb_group_d rrb_je rrb_alp rpf ibps_po ibps_clerk ibps_so" ;;
-              5) EXAMS="sbi_po sbi_clerk rbi_grade_b rbi_assistant nabard sebi lic_aao lic_ado" ;;
-              6) EXAMS="cbse_10 cbse_11 cbse_12 icse_10 isc_12 cuet olympiad ntse" ;;
-              7) EXAMS="ctet ugc_net kvs dsssb uptet supertet bihar_tet mptet reet htet" ;;
-              8) EXAMS="uppsc bpsc mppsc rpsc tnpsc wbpsc appsc hpsc jpsc ukpsc cgpsc gpsc opsc ppsc kpsc" ;;
-              9) EXAMS="up_police up_si bihar_police bihar_si mp_police raj_police haryana_police delhi_police" ;;
-              10) EXAMS="gnm anm bsc_nursing bpharm dpharm dmlt icar fci epfo" ;;
-              11) EXAMS="up_lekhpal mp_patwari raj_patwari up_vdo up_ro_aro mp_vyapam hssc jssc clat cat xat mat" ;;
+              1) EXAMS="gate_me gate_ee gate_ce gate_ch ese isro" ;;
+              2) EXAMS="ssc_cgl ssc_chsl ssc_mts ssc_gd ssc_cpo" ;;
+              3) EXAMS="upsc_prelims upsc_mains nda cds afcat" ;;
+              4) EXAMS="rrb_ntpc rrb_group_d ibps_po ibps_clerk" ;;
+              5) EXAMS="sbi_po sbi_clerk rbi_grade_b nabard lic_aao" ;;
+              6) EXAMS="cbse_10 cbse_12 cuet olympiad ntse" ;;
+              7) EXAMS="ctet ugc_net kvs dsssb uptet" ;;
+              8) EXAMS="uppsc bpsc mppsc rpsc tnpsc" ;;
+              9) EXAMS="up_police bihar_police mp_police delhi_police" ;;
+              10) EXAMS="gnm anm bsc_nursing bpharm epfo" ;;
+              11) EXAMS="clat cat xat up_lekhpal hssc" ;;
             esac
             for exam in $EXAMS; do
               timeout 120 python manage.py generate_pyq --exam "$exam" --skip-existing --count 10 2>&1 || echo "  [SKIP] $exam"
@@ -129,24 +125,27 @@ jobs:
               print(f'  {e[\"exam_type\"]}: {e[\"c\"]}')
           "
 
-      - name: Commit and push
+      - name: Validate and upload DB to release
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add db.sqlite3 --force
-          if git diff --cached --quiet; then
-            echo "No new data"
+          TOTAL=$(python -c "
+          import django, os
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          django.setup()
+          from pyq.models import ExamQuestion
+          print(ExamQuestion.objects.count())
+          " 2>/dev/null || echo "0")
+          if [ "$TOTAL" -gt 0 ]; then
+            gzip -c db.sqlite3 > db.sqlite3.gz
+            gh release upload db-v1 db.sqlite3.gz --clobber
+            echo "Uploaded DB with $TOTAL PYQ questions"
           else
-            git commit -m "chore: update PYQ database $(date -u +%Y-%m-%d)"
-            for i in 1 2 3; do
-              git pull --rebase origin main && git push && break
-              sleep 5
-            done
+            echo "DB empty, skipping upload"
           fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DJANGO_SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
+          DJANGO_SETTINGS_MODULE: config.settings
 
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: pyq-db-${{ github.run_number }}
-          path: db.sqlite3
-          retention-days: 30
+      - name: Trigger Render redeploy
+        if: success()
+        run: curl -s "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
