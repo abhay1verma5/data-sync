@@ -2,8 +2,8 @@ name: Daily Job Crawler
 
 on:
   schedule:
-    - cron: '0 */4 * * *'   # Every 4 hours
-  workflow_dispatch:         # Manual trigger
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -19,8 +19,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download latest DB from release
+        run: |
+          curl -fL -o db.sqlite3.gz "https://github.com/abhay1verma5/data-sync/releases/download/db-v1/db.sqlite3.gz" || true
+          [ -f db.sqlite3.gz ] && gunzip -f db.sqlite3.gz || echo "No release DB, starting fresh"
 
       - uses: actions/setup-python@v5
         with:
@@ -38,11 +41,7 @@ jobs:
           DJANGO_SETTINGS_MODULE: config.settings
 
       - name: Crawl all job sources
-        run: |
-          echo "========================================"
-          echo "  CRAWLING ALL JOB SOURCES"
-          echo "========================================"
-          timeout 900 python manage.py crawl_jobs 2>&1 || echo "[DONE]"
+        run: timeout 900 python manage.py crawl_jobs 2>&1 || echo "[DONE]"
         env:
           DJANGO_SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
           DJANGO_SETTINGS_MODULE: config.settings
@@ -52,6 +51,13 @@ jobs:
         env:
           DJANGO_SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
           DJANGO_SETTINGS_MODULE: config.settings
+
+      - name: Crawl current affairs
+        run: timeout 120 python manage.py crawl_current_affairs --days 2 2>&1 || echo "[DONE]"
+        env:
+          DJANGO_SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
+          DJANGO_SETTINGS_MODULE: config.settings
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
       - name: Backfill Hindi titles
         run: timeout 120 python manage.py backfill_hindi 2>&1 || echo "[DONE]"
@@ -71,30 +77,32 @@ jobs:
           from jobs.models import Job
           from django.db.models import Count
           total = Job.objects.count()
-          active = Job.objects.filter(is_active=True).count()
-          print(f'Jobs: {total} (Active: {active})')
+          print(f'Jobs: {total}')
           for t in Job.objects.values('content_type').annotate(c=Count('id')).order_by('-c'):
               print(f'  {t[\"content_type\"]}: {t[\"c\"]}')
           "
 
-      - name: Commit and push
+      - name: Validate and upload DB to release
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add db.sqlite3 --force
-          if git diff --cached --quiet; then
-            echo "No new data"
+          JOBS=$(python -c "
+          import django, os
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          django.setup()
+          from jobs.models import Job
+          print(Job.objects.count())
+          " 2>/dev/null || echo "0")
+          if [ "$JOBS" -gt 0 ]; then
+            gzip -c db.sqlite3 > db.sqlite3.gz
+            gh release upload db-v1 db.sqlite3.gz --clobber
+            echo "Uploaded DB with $JOBS jobs"
           else
-            git commit -m "chore: update job database $(date -u +%Y-%m-%d)"
-            for i in 1 2 3; do
-              git pull --rebase origin main && git push && break
-              sleep 5
-            done
+            echo "DB empty, skipping upload"
           fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DJANGO_SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
+          DJANGO_SETTINGS_MODULE: config.settings
 
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: db-${{ github.run_number }}
-          path: db.sqlite3
-          retention-days: 7
+      - name: Trigger Render redeploy
+        if: success()
+        run: curl -s "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
